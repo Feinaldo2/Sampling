@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Dream GSM8K Custom",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/evaluation_script.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model", "dream",
+                "--model_args", "pretrained=/home/zhaoyifei/Sampling/Models/Dream-base,max_new_tokens=256,diffusion_steps=256,temperature=0.2,top_p=0.95,add_bos_token=true,is_feature_cache=False,is_cfg_cache=False,use_attention_fusion=True,fusion_type=static,static_weight=0.6|0.2|0.2,dynamic_weight_path=,feature_path=",
+                "--tasks", "gsm8k",
+                "--num_fewshot", "8",
+                "--batch_size", "1",
+                "--output_path", "./gsm8k_dream_custom_log",
+                "--log_samples"
+            ],
+            "env": {
+                "HF_HOME": "$HOME/.cache/huggingface"
+            }
+        }
+    ]
+} 
