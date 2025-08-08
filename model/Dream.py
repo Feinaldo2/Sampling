@@ -9,7 +9,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Union,Type,TypeVar
 
 
 import jinja2
-from matplotlib import pyplot as plt
+# from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -98,6 +98,11 @@ class Dream(LM):
         use_attention_fusion: bool = False,
         fusion_type: str = "static",
         static_weight: str = "0.6|0.2|0.2",
+        fusion_mode: str = "linear",
+        # ✅ 新增优化参数
+        k_exploration_steps: int = 6,
+        cycle_length_stability_window: int = 2,
+        use_fast_attention: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -110,7 +115,13 @@ class Dream(LM):
         
         self.fusion_type = fusion_type
         self.static_weight = [float(x) for x in static_weight.split("|")]
-        self.use_attention_fusion = use_attention_fusion  # ✅ 添加这行
+        self.use_attention_fusion = use_attention_fusion
+        self.fusion_mode = fusion_mode
+
+        # ✅ 存储优化参数
+        self.k_exploration_steps = k_exploration_steps
+        self.cycle_length_stability_window = cycle_length_stability_window
+        self.use_fast_attention = use_fast_attention
 
         # prepare for parallelism
         assert isinstance(device, str)
@@ -301,6 +312,7 @@ class Dream(LM):
                 # 也要设置到语义注意力模块中
                 self.model.semantic_weight_attention.static_fusion_weights = self.static_weight
                 self.model.semantic_weight_attention.use_static_fusion = True
+                self.model.semantic_weight_attention.fusion_mode = self.fusion_mode
             else:
                 self.model.use_static_fusion = False
                 self.model.semantic_weight_attention.use_static_fusion = False
@@ -385,6 +397,10 @@ class Dream(LM):
             alg_temp=self.alg_temp,
             output_attentions=True,  # ✅ 启用 attention 输出
             use_attention_fusion=self.use_attention_fusion,  # ✅ 传递融合配置
+            # ✅ 传递优化参数
+            k_exploration_steps=self.k_exploration_steps,
+            cycle_length_stability_window=self.cycle_length_stability_window,
+            use_fast_attention=self.use_fast_attention,
         )
         # 兼容单返回值和三返回值
         if isinstance(result, tuple) and len(result) == 3:

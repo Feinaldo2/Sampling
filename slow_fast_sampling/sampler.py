@@ -6,8 +6,9 @@ import torch
 from dllm_cache import FeatureCache
 from slow_fast_sampling.semantic_weight_attention import SemanticWeightSelfAttention
 
-def extract_token_features(x, logits, attention_weights, prompt_length, mask_id, prompt_mask):
+def extract_token_features_fast(x, logits, attention_weights, prompt_length, mask_id, prompt_mask):
     """
+    优化版本：向量化计算，避免循环
     x: [batch, seq_len] 当前 token 序列
     logits: [batch, seq_len, vocab_size] 当前 logits
     attention_weights: [batch, nhead, seq_len, seq_len] 当前注意力权重
@@ -18,32 +19,149 @@ def extract_token_features(x, logits, attention_weights, prompt_length, mask_id,
     """
     batch, seq_len = x.shape
     nhead = attention_weights.shape[1]
+
+    # 找到所有mask位置
+    mask_positions = (x == mask_id)
+    gen_mask_positions = mask_positions[:, prompt_length:]  # 只考虑生成部分的mask
+
+    if not gen_mask_positions.any():
+        return torch.empty(0, 5, dtype=torch.float32, device=x.device)
+
+    # 向量化计算置信度
+    prob = torch.softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+    conf_all = prob.max(dim=-1)[0]  # [batch, seq_len]
+
+    # 向量化计算注意力熵（仅对mask位置）
+    # attention_weights: [batch, nhead, seq_len, seq_len]
+    attn_normalized = attention_weights / (attention_weights.sum(dim=-1, keepdim=True) + 1e-8)
+    entropy_all = -(attn_normalized * (attn_normalized + 1e-8).log()).sum(dim=-1)  # [batch, nhead, seq_len]
+    entropy_all = entropy_all.mean(dim=1)  # 平均所有头 [batch, seq_len]
+
+    # 向量化计算prompt mass
+    prompt_attn = attention_weights[:, :, :, :prompt_length]  # [batch, nhead, seq_len, prompt_length]
+    prompt_mass_all = prompt_attn.sum(dim=-1).mean(dim=1)  # [batch, seq_len]
+
+    # 位置信息
+    positions = torch.arange(seq_len, device=x.device).float() / seq_len  # [seq_len]
+    positions = positions.unsqueeze(0).expand(batch, -1)  # [batch, seq_len]
+
+    # 提取mask位置的特征
     features = []
     for b in range(batch):
-        for i in range(prompt_length, seq_len):
-            if x[b, i] == mask_id:
-                # softmax 置信度
-                prob = torch.softmax(logits[b, i], dim=-1)
-                conf = prob.max().item()
-                # 注意力熵
-                entropy = 0.0
-                for h in range(nhead):
-                    attn = attention_weights[b, h, i, :]
-                    attn = attn / (attn.sum() + 1e-8)
-                    entropy += -(attn * (attn + 1e-8).log()).sum().item()
-                entropy = entropy / nhead
-                # prompt mass
-                prompt_mass = 0.0
-                for h in range(nhead):
-                    attn = attention_weights[b, h, i, :prompt_length]
-                    prompt_mass += attn.sum().item()
-                prompt_mass = prompt_mass / nhead
-                # 位置归一化
-                pos = i / seq_len
-                # mask_type
-                mask_type = 0 if i < prompt_length else 1
-                features.append([conf, 1-entropy, prompt_mass, pos, mask_type])
-    return torch.tensor(features, dtype=torch.float32)
+        mask_indices = torch.where(gen_mask_positions[b])[0] + prompt_length  # 转换为全局索引
+        if len(mask_indices) > 0:
+            batch_features = torch.stack([
+                conf_all[b, mask_indices],           # 置信度
+                1 - entropy_all[b, mask_indices],    # 1-熵
+                prompt_mass_all[b, mask_indices],    # prompt mass
+                positions[b, mask_indices],          # 位置
+                torch.ones_like(mask_indices, dtype=torch.float32)  # mask_type=1 (生成区域)
+            ], dim=1)  # [num_mask_in_batch, 5]
+            features.append(batch_features)
+
+    if features:
+        return torch.cat(features, dim=0)  # [total_num_mask, 5]
+    else:
+        return torch.empty(0, 5, dtype=torch.float32, device=x.device)
+
+
+
+def extract_token_features_optimized(x, logits, attention_weights, prompt_length, mask_id, prompt_mask):
+    """
+    优化版本：保留完整的attention计算，但使用高效的向量化实现
+    - 保留注意力熵计算（体现模型的不确定性）
+    - 保留prompt关联度计算（体现对prompt的依赖）
+    - 大幅提升计算速度（向量化 + 减少GPU-CPU同步）
+    """
+    batch, seq_len = x.shape
+    device = x.device
+
+    # 找到所有mask位置
+    mask_positions = (x == mask_id)
+    gen_mask_positions = mask_positions[:, prompt_length:]  # 只考虑生成部分的mask
+
+    if not gen_mask_positions.any():
+        return torch.empty(0, 5, dtype=torch.float32, device=device)
+
+    # ✅ 1. 向量化计算置信度（保持原有逻辑）
+    prob = torch.softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+    conf_all = prob.max(dim=-1)[0]  # [batch, seq_len]
+
+    # ✅ 2. 高效计算注意力熵（保留attention信息）
+    # 一次性归一化所有注意力权重
+    attn_sum = attention_weights.sum(dim=-1, keepdim=True) + 1e-8
+    attn_normalized = attention_weights / attn_sum  # [batch, nhead, seq_len, seq_len]
+
+    # 向量化计算熵：-Σ(p * log(p))
+    log_attn = (attn_normalized + 1e-8).log()
+    entropy_per_head = -(attn_normalized * log_attn).sum(dim=-1)  # [batch, nhead, seq_len]
+    entropy_all = entropy_per_head.mean(dim=1)  # 平均所有头 [batch, seq_len]
+
+    # ✅ 3. 高效计算prompt关联度（保留attention信息）
+    prompt_attn = attention_weights[:, :, :, :prompt_length]  # [batch, nhead, seq_len, prompt_length]
+    prompt_mass_all = prompt_attn.sum(dim=-1).mean(dim=1)  # [batch, seq_len]
+
+    # ✅ 4. 位置信息
+    positions = torch.arange(seq_len, device=device).float() / seq_len
+    positions = positions.unsqueeze(0).expand(batch, -1)  # [batch, seq_len]
+
+    # ✅ 5. 高效提取mask位置的特征（避免Python循环）
+    features_list = []
+    for b in range(batch):
+        mask_indices = torch.where(gen_mask_positions[b])[0] + prompt_length
+        if len(mask_indices) > 0:
+            batch_features = torch.stack([
+                conf_all[b, mask_indices],                    # 置信度
+                1 - entropy_all[b, mask_indices],             # 1-熵（保留attention信息）
+                prompt_mass_all[b, mask_indices],             # prompt关联度（保留attention信息）
+                positions[b, mask_indices],                   # 位置
+                torch.ones_like(mask_indices, dtype=torch.float32)  # mask_type=1
+            ], dim=1)
+            features_list.append(batch_features)
+
+    if features_list:
+        return torch.cat(features_list, dim=0)
+    else:
+        return torch.empty(0, 5, dtype=torch.float32, device=device)
+
+def extract_token_features(x, logits, attention_weights, prompt_length, mask_id, prompt_mask, use_fast_mode=True):
+    """
+    统一接口：根据模式选择实现
+    use_fast_mode=True: 使用优化版本（推荐）
+    use_fast_mode=False: 使用原始版本（用于对比）
+    """
+    if use_fast_mode:
+        return extract_token_features_optimized(x, logits, attention_weights, prompt_length, mask_id, prompt_mask)
+    else:
+        # 原始版本（保留用于对比和验证）
+        batch, seq_len = x.shape
+        nhead = attention_weights.shape[1]
+        features = []
+        for b in range(batch):
+            for i in range(prompt_length, seq_len):
+                if x[b, i] == mask_id:
+                    # softmax 置信度
+                    prob = torch.softmax(logits[b, i], dim=-1)
+                    conf = prob.max().item()
+                    # 注意力熵
+                    entropy = 0.0
+                    for h in range(nhead):
+                        attn = attention_weights[b, h, i, :]
+                        attn = attn / (attn.sum() + 1e-8)
+                        entropy += -(attn * (attn + 1e-8).log()).sum().item()
+                    entropy = entropy / nhead
+                    # prompt mass
+                    prompt_mass = 0.0
+                    for h in range(nhead):
+                        attn = attention_weights[b, h, i, :prompt_length]
+                        prompt_mass += attn.sum().item()
+                    prompt_mass = prompt_mass / nhead
+                    # 位置归一化
+                    pos = i / seq_len
+                    # mask_type
+                    mask_type = 0 if i < prompt_length else 1
+                    features.append([conf, 1-entropy, prompt_mass, pos, mask_type])
+        return torch.tensor(features, dtype=torch.float32, device=x.device)
 
 class SlowFastSampler:
     def __init__(
@@ -54,6 +172,7 @@ class SlowFastSampler:
         temperature=0.0,
         cfg_scale=0.0,
         semantic_weight_module=None,  # 新增
+        use_attention_fusion=True,  # 新增：控制是否使用attention融合
     ):
         self.model = model
         self.mask_id = mask_id
@@ -69,6 +188,16 @@ class SlowFastSampler:
         self.gen_length=gen_kwargs.get("gen_length", 128)
         self.block_length=gen_kwargs.get("block_length", 128)
         self.semantic_weight_module = semantic_weight_module  # 新增
+        self.use_attention_fusion = use_attention_fusion  # 新增：存储融合标志
+
+        # 性能优化选项
+        self.use_fast_attention = gen_kwargs.get("use_fast_attention", True)  # 是否使用快速注意力计算
+        self.attention_sample_ratio = gen_kwargs.get("attention_sample_ratio", 0.1)  # 注意力采样比例
+        self.skip_entropy_steps = gen_kwargs.get("skip_entropy_steps", 2)  # 每N步计算一次熵
+        self.attention_computation_frequency = gen_kwargs.get("attention_computation_frequency", 1)  # 每N步计算一次attention特征
+
+        # 步数计数器
+        self._step_counter = 0
     
     def add_gumbel_noise(self,logits):
         """
@@ -116,30 +245,36 @@ class SlowFastSampler:
             p_gen = F.softmax(logits_gen_part, dim=-1)
             x0_p_gen = torch.gather(p_gen, dim=-1, index=x0_gen.unsqueeze(-1)).squeeze(-1)
 
-            # 动态置信度融合
-            if self.semantic_weight_module is not None and attn is not None:
-                # attn: [batch, nhead, seq_len, seq_len]
+            # 动态置信度融合（优化版本）
+            # ✅ 修复：检查use_attention_fusion标志
+            if self.use_attention_fusion and self.semantic_weight_module is not None and attn is not None:
+                # ✅ 始终使用优化版本，保留完整的attention计算
                 prompt_mask = (x[:, :].clone() != self.mask_id).long()
-                features = extract_token_features(x, logits_full, attn, prompt_length, self.mask_id, prompt_mask)
-                weights = self.semantic_weight_module(features)  # [num_mask, 3]
-                # features: [conf, 1-entropy, prompt_mass, pos, mask_type]
-                conf = features[:, 0]
-                entropy = 1 - features[:, 1]
-                pmass = features[:, 2]
-                alpha, beta, gamma = weights[:, 0], weights[:, 1], weights[:, 2]
-                semantic_conf = alpha * conf + beta * (1 - entropy) + gamma * pmass
-                # 用 semantic_conf 替换 confidence_gen_wide
-                # 这里简化处理：将 semantic_conf 按 mask 顺序填入 confidence_gen_wide 的 mask 位置
-                confidence_gen_wide = torch.full_like(x0_p_gen, -float('inf'))
-                mask_indices = (x[:, prompt_length:] == self.mask_id)
-                idx = 0
-                for b in range(x.shape[0]):
-                    for i in range(x0_p_gen.shape[1]):
-                        if mask_indices[b, i]:
-                            confidence_gen_wide[b, i] = semantic_conf[idx]
-                            idx += 1
+                features = extract_token_features(x, logits_full, attn, prompt_length, self.mask_id, prompt_mask, use_fast_mode=True)
+
+                if features.numel() > 0:  # 确保有mask tokens
+                    weights = self.semantic_weight_module(features)  # [num_mask, 3]
+                    # features: [conf, 1-entropy, prompt_mass, pos, mask_type]
+                    conf = features[:, 0]
+                    entropy = 1 - features[:, 1]
+                    pmass = features[:, 2]
+                    alpha, beta, gamma = weights[:, 0], weights[:, 1], weights[:, 2]
+                    semantic_conf = alpha * conf + beta * (1 - entropy) + gamma * pmass
+
+                    # 优化：直接构建confidence_gen_wide
+                    current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
+                    confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
+
+                    # 将semantic_conf填入对应位置
+                    mask_positions = torch.where(current_global_mask_index_gen_part)
+                    if len(mask_positions[0]) > 0:
+                        confidence_gen_wide[mask_positions] = semantic_conf[:len(mask_positions[0])]
+                else:
+                    # 没有mask tokens，使用原始置信度
+                    current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
+                    confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
             else:
-                current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id) 
+                current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
                 confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
 
             #Estimate sub-cycle length (focus on current block)
@@ -299,24 +434,31 @@ class SlowFastSampler:
             p_gen = F.softmax(logits_gen_part, dim=-1)
             x0_p_gen = torch.gather(p_gen, dim=-1, index=x0_gen.unsqueeze(-1)).squeeze(-1)
             current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
-            # 动态置信度融合
-            if self.semantic_weight_module is not None and attn is not None:
+            # 动态置信度融合（优化版本）
+            # ✅ 修复：检查use_attention_fusion标志
+            if self.use_attention_fusion and self.semantic_weight_module is not None and attn is not None:
+                # ✅ 始终使用优化版本，保留完整的attention计算
                 prompt_mask = (x[:, :].clone() != self.mask_id).long()
-                features = extract_token_features(x, logits_full, attn, prompt_length, self.mask_id, prompt_mask)
-                weights = self.semantic_weight_module(features)  # [num_mask, 3]
-                conf = features[:, 0]
-                entropy = 1 - features[:, 1]
-                pmass = features[:, 2]
-                alpha, beta, gamma = weights[:, 0], weights[:, 1], weights[:, 2]
-                semantic_conf = alpha * conf + beta * (1 - entropy) + gamma * pmass
-                confidence_gen_wide = torch.full_like(x0_p_gen, -float('inf'))
-                mask_indices = (x[:, prompt_length:] == self.mask_id)
-                idx = 0
-                for b in range(x.shape[0]):
-                    for i in range(x0_p_gen.shape[1]):
-                        if mask_indices[b, i]:
-                            confidence_gen_wide[b, i] = semantic_conf[idx]
-                            idx += 1
+                features = extract_token_features(x, logits_full, attn, prompt_length, self.mask_id, prompt_mask, use_fast_mode=True)
+
+                if features.numel() > 0:  # 确保有mask tokens
+                    weights = self.semantic_weight_module(features)  # [num_mask, 3]
+                    conf = features[:, 0]
+                    entropy = 1 - features[:, 1]
+                    pmass = features[:, 2]
+                    alpha, beta, gamma = weights[:, 0], weights[:, 1], weights[:, 2]
+                    semantic_conf = alpha * conf + beta * (1 - entropy) + gamma * pmass
+
+                    # 优化：直接构建confidence_gen_wide
+                    confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
+
+                    # 将semantic_conf填入对应位置
+                    mask_positions = torch.where(current_global_mask_index_gen_part)
+                    if len(mask_positions[0]) > 0:
+                        confidence_gen_wide[mask_positions] = semantic_conf[:len(mask_positions[0])]
+                else:
+                    # 没有mask tokens，使用原始置信度
+                    confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
             else:
                 confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
             transfer_mask_p2_and_p3 = torch.zeros_like(x0_gen, dtype=torch.bool)
