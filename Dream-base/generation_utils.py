@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The Dream team, HKUNLP Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -484,7 +483,8 @@ class DreamGenerationMixin:
         
         for i in range(steps):
             mask_index = (x == mask_token_id)
-            logits = self(x, attention_mask, tok_idx).logits
+            model_outputs = self(x, attention_mask, tok_idx, output_attentions=True)
+            logits = model_outputs.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
             # this allows user-defined logits control of the intermediate steps
@@ -507,24 +507,100 @@ class DreamGenerationMixin:
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k, margin_confidence=True)
                 elif alg == 'entropy':
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
+                    # 🚨 调试：确认进入entropy分支
+                    print(f"🔍 DEBUG: 进入entropy分支，环境变量ATTENTION_TYPE={os.environ.get('ATTENTION_TYPE', 'NOT_SET')}")
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
                 
-                # ✅ 添加 pmass 计算和融合置信度
+                # 🔬 添加attention特征计算和融合置信度 (支持多种计算方式)
+                import os
+                attention_type = os.environ.get('ATTENTION_TYPE', 'pmass')
+
+                # 🚨 调试输出：确认attention类型
+                print(f"🔍 DEBUG: 使用attention类型: {attention_type}")
+
                 if hasattr(model_outputs, 'attentions') and model_outputs.attentions is not None:
                     last_layer_attn = model_outputs.attentions[-1]  # [B, H, T, T]
                     if last_layer_attn is not None and last_layer_attn.dim() == 4:
                         # 处理 batch 维度
                         batch_size = x.shape[0]
-                        pmass_for_masks = []
+                        attention_features_for_masks = []
+
                         for b_idx in range(batch_size):
                             attn_avg = last_layer_attn[b_idx].mean(dim=0)  # [T, T]
-                            gen_to_prompt_attn = attn_avg[input_ids.shape[1]:, :input_ids.shape[1]]  # [gen_length, prompt_length]
-                            pmass = gen_to_prompt_attn.sum(dim=-1)  # [gen_length]
-                            # 只取当前 batch 的 mask 位置对应的 pmass
-                            pmass_for_batch = pmass[mask_index[b_idx, input_ids.shape[1]:]]
-                            pmass_for_masks.append(pmass_for_batch)
-                        pmass_for_masks = torch.cat(pmass_for_masks, dim=0)
+
+                            if attention_type == 'pmass':
+                                # 原始pmass计算
+                                gen_to_prompt_attn = attn_avg[input_ids.shape[1]:, :input_ids.shape[1]]
+                                attention_feature = gen_to_prompt_attn.sum(dim=-1)
+
+                            elif attention_type == 'attention_entropy':
+                                # Attention熵：衡量attention分布的不确定性
+                                gen_attn = attn_avg[input_ids.shape[1]:, :]  # [gen_length, total_length]
+                                gen_attn_normalized = gen_attn / (gen_attn.sum(dim=-1, keepdim=True) + 1e-8)
+                                attention_feature = -(gen_attn_normalized * (gen_attn_normalized + 1e-8).log()).sum(dim=-1)
+                                # 归一化到[0,1]
+                                attention_feature = attention_feature / np.log(gen_attn.shape[-1])
+
+                            elif attention_type == 'max_attention':
+                                # 最大attention值：衡量最强关注的强度
+                                gen_attn = attn_avg[input_ids.shape[1]:, :]
+                                attention_feature = gen_attn.max(dim=-1)[0]
+
+                            elif attention_type == 'self_attention':
+                                # Self-attention强度：对自身token的关注
+                                gen_length = attn_avg.shape[0] - input_ids.shape[1]
+                                if gen_length > 0:
+                                    gen_indices = torch.arange(input_ids.shape[1], attn_avg.shape[0], device=attn_avg.device)
+                                    attention_feature = attn_avg[gen_indices, gen_indices]
+                                else:
+                                    attention_feature = torch.tensor([], device=attn_avg.device)
+
+                            elif attention_type == 'attention_variance':
+                                # Attention方差：衡量attention分布的集中程度
+                                gen_attn = attn_avg[input_ids.shape[1]:, :]
+                                attention_feature = gen_attn.var(dim=-1)
+
+
+
+
+
+                            elif attention_type == 'k_direction':
+                                # K方向：当前token作为Key时，被其他token关注的程度
+                                # k_direction_i = sum_j(mean_head(attn_weights[j, :, j, i]))
+                                gen_length = attn_avg.shape[0] - input_ids.shape[1]
+                                if gen_length > 0:
+                                    # 对于生成部分的每个token i，计算所有位置j对它的attention
+                                    k_direction_scores = []
+                                    for i in range(input_ids.shape[1], attn_avg.shape[0]):
+                                        # 所有位置对当前token i的attention权重和
+                                        k_direction_score = attn_avg[:, i].sum()
+                                        k_direction_scores.append(k_direction_score)
+                                    attention_feature = torch.tensor(k_direction_scores, device=attn_avg.device)
+                                else:
+                                    attention_feature = torch.tensor([], device=attn_avg.device)
+
+
+
+
+
+                            else:
+                                # 默认使用pmass
+                                gen_to_prompt_attn = attn_avg[input_ids.shape[1]:, :input_ids.shape[1]]
+                                attention_feature = gen_to_prompt_attn.sum(dim=-1)
+
+                            # 只取当前 batch 的 mask 位置对应的 attention feature
+                            if len(attention_feature) > 0:
+                                attention_feature_for_batch = attention_feature[mask_index[b_idx, input_ids.shape[1]:]]
+                                attention_features_for_masks.append(attention_feature_for_batch)
+                            else:
+                                # 如果没有生成token，创建空tensor
+                                attention_features_for_masks.append(torch.tensor([], device=attn_avg.device))
+
+                        if attention_features_for_masks and len(attention_features_for_masks[0]) > 0:
+                            pmass_for_masks = torch.cat(attention_features_for_masks, dim=0)
+                        else:
+                            pmass_for_masks = torch.zeros_like(confidence)
                     else:
                         pmass_for_masks = torch.zeros_like(confidence)
                 else:
@@ -594,10 +670,28 @@ class DreamGenerationMixin:
         # 大循环的次数 (新超参数)
         MAX_MAJOR_CYCLES = getattr(generation_config, "max_major_cycles", 5)
 
-        # 阶段0 (周期发现) 的参数
-        N_CYCLE_DISCOVERY_STEPS = getattr(generation_config, "n_cycle_discovery_steps", 6) # 每个大循环内，发现阶段的步数
+        # ✅ 兼容原始版本的参数名称
+        # 优先使用新参数名，如果没有则使用旧参数名
+        k_exploration_steps = getattr(generation_config, "k_exploration_steps", None)
+        if k_exploration_steps is None:
+            k_exploration_steps = getattr(generation_config, "n_cycle_discovery_steps", 6)
+        N_CYCLE_DISCOVERY_STEPS = k_exploration_steps
+
+        cycle_length_stability_window = getattr(generation_config, "cycle_length_stability_window", None)
+        if cycle_length_stability_window is None:
+            cycle_length_stability_window = getattr(generation_config, "stabilize_count", 2)
+        STABILIZE_COUNT = cycle_length_stability_window
+
+        # 新增优化参数
+        use_fast_attention = getattr(generation_config, "use_fast_attention", True)
+
+        # ✅ Attention fusion 参数
+        use_attention_fusion = getattr(generation_config, "use_attention_fusion", False)
+        fusion_type = getattr(generation_config, "fusion_type", "static")
+        static_weight = getattr(generation_config, "static_weight", "0.6|0.2|0.2")
+
+        # 原有参数
         CONF_THRESHOLD_CYCLE_LEN_PRED = getattr(generation_config, "conf_threshold_cycle_len_pred", 0.1)
-        STABILIZE_COUNT = getattr(generation_config, "stabilize_count", 2) # 建议 >=2
         MIN_CYCLE_LEN_FOR_STAB = getattr(generation_config, "min_cycle_len_for_stab", 3)
         CYCLE_LEN_VARIANCE_THRESHOLD = getattr(generation_config, "cycle_len_variance_threshold", 1.0)
         HIGH_CONF_FOR_PARALLEL_DECODE_DISCOVERY = getattr(generation_config, "high_conf_for_parallel_decode_discovery", 0.8)
@@ -661,7 +755,7 @@ class DreamGenerationMixin:
                 
                 mask_positions_bool_p0 = (x == mask_token_id)
                 
-                model_outputs_p0 = self(x, attention_mask_for_model, tok_idx)
+                model_outputs_p0 = self(x, attention_mask_for_model, tok_idx, output_attentions=True)
                 logits_p0 = model_outputs_p0.logits
                 logits_p0 = torch.cat([logits_p0[:,:1], logits_p0[:, :-1]], dim=1)
                 logits_p0 = generation_logits_hook_func(global_model_calls, x, logits_p0)
@@ -679,7 +773,72 @@ class DreamGenerationMixin:
                     # === 融合置信度 ===
                     entropy = -torch.sum(probs * (probs + 1e-8).log(), dim=-1)
                     entropy = entropy / np.log(probs.shape[-1])
-                    pmass = torch.zeros_like(confidence)  # 如无 attention mass
+
+                    # ✅ 修复：计算真实的pmass而不是强制设为0
+                    if hasattr(model_outputs_p0, 'attentions') and model_outputs_p0.attentions is not None:
+                        last_layer_attn = model_outputs_p0.attentions[-1]  # [B, H, T, T]
+                        if last_layer_attn is not None and last_layer_attn.dim() == 4:
+                            # 🔬 添加attention特征计算切换 (真正被使用的地方)
+                            import os
+                            attention_type = os.environ.get('ATTENTION_TYPE', 'pmass')
+                            print(f"🔍 DEBUG P0: 使用attention类型: {attention_type}")
+
+                            attn_avg = last_layer_attn[b_idx].mean(dim=0)  # [T, T]
+
+                            if attention_type == 'pmass':
+                                # 原始pmass计算
+                                gen_to_prompt_attn = attn_avg[prompt_length:, :prompt_length]
+                                pmass_full = gen_to_prompt_attn.sum(dim=-1)
+                            elif attention_type == 'attention_entropy':
+                                # Attention熵
+                                gen_attn = attn_avg[prompt_length:, :]
+                                gen_attn_normalized = gen_attn / (gen_attn.sum(dim=-1, keepdim=True) + 1e-8)
+                                pmass_full = -(gen_attn_normalized * (gen_attn_normalized + 1e-8).log()).sum(dim=-1)
+                                pmass_full = pmass_full / np.log(gen_attn.shape[-1])
+                            elif attention_type == 'max_attention':
+                                # 最大attention值
+                                gen_attn = attn_avg[prompt_length:, :]
+                                pmass_full = gen_attn.max(dim=-1)[0]
+                            elif attention_type == 'self_attention':
+                                # Self-attention强度
+                                gen_length = attn_avg.shape[0] - prompt_length
+                                if gen_length > 0:
+                                    gen_indices = torch.arange(prompt_length, attn_avg.shape[0], device=attn_avg.device)
+                                    pmass_full = attn_avg[gen_indices, gen_indices]
+                                else:
+                                    pmass_full = torch.tensor([], device=attn_avg.device)
+                            elif attention_type == 'attention_variance':
+                                # Attention方差
+                                gen_attn = attn_avg[prompt_length:, :]
+                                pmass_full = gen_attn.var(dim=-1)
+                            elif attention_type == 'k_direction':
+                                # K方向：被其他token关注的程度
+                                gen_length = attn_avg.shape[0] - prompt_length
+                                if gen_length > 0:
+                                    k_direction_scores = []
+                                    for i in range(prompt_length, attn_avg.shape[0]):
+                                        k_direction_score = attn_avg[:, i].sum()
+                                        k_direction_scores.append(k_direction_score)
+                                    pmass_full = torch.tensor(k_direction_scores, device=attn_avg.device)
+                                else:
+                                    pmass_full = torch.tensor([], device=attn_avg.device)
+                            else:
+                                # 默认使用pmass
+                                gen_to_prompt_attn = attn_avg[prompt_length:, :prompt_length]
+                                pmass_full = gen_to_prompt_attn.sum(dim=-1)
+                            # 只取当前周期的pmass
+                            if len(pmass_full) > start_cycle_idx:
+                                pmass = pmass_full[start_cycle_idx:start_cycle_idx + len(confidence)]
+                                # 确保长度匹配
+                                if len(pmass) != len(confidence):
+                                    pmass = pmass[:len(confidence)] if len(pmass) > len(confidence) else torch.cat([pmass, torch.zeros(len(confidence) - len(pmass), device=pmass.device)])
+                            else:
+                                pmass = torch.zeros_like(confidence)
+                        else:
+                            pmass = torch.zeros_like(confidence)
+                    else:
+                        pmass = torch.zeros_like(confidence)
+
                     if hasattr(self, '_fuse_confidence'):
                         semantic_conf = self._fuse_confidence(confidence, entropy, pmass)
                     else:
@@ -782,7 +941,9 @@ class DreamGenerationMixin:
 
                 any_progress_this_p1_step = False # Flag to see if any token was decoded in this p1 step across batch
                 if phase1_steps_this_major_cycle == 0:
-                    logits_p1 = self(x, attention_mask_for_model, tok_idx).logits
+                    # ✅ 修复：获取完整的model_outputs以便计算pmass
+                    model_outputs_p1 = self(x, attention_mask_for_model, tok_idx, output_attentions=True)
+                    logits_p1 = model_outputs_p1.logits
                     cache_for_out_cycle = logits_p1[:, end_abs_idx:]
                     total_model_calls_length += gen_length
                 else:
@@ -790,7 +951,8 @@ class DreamGenerationMixin:
                     current_attention_mask_p1 = attention_mask_for_model[:, :, :end_abs_idx, :end_abs_idx] \
                                             if attention_mask_for_model != "full" and attention_mask_for_model is not None \
                                             else attention_mask_for_model 
-                    logits_p1 = self(x[:, :end_abs_idx], current_attention_mask_p1, current_tok_idx_p1).logits
+                    model_outputs_p1_cache = self(x[:, :end_abs_idx], current_attention_mask_p1, current_tok_idx_p1, output_attentions=True)
+                    logits_p1 = model_outputs_p1_cache.logits
                     logits_p1 = torch.cat([logits_p1, cache_for_out_cycle], dim=1)
                     total_model_calls_length += end_cycle_idx
                 
@@ -813,7 +975,73 @@ class DreamGenerationMixin:
                     # === 融合置信度 ===
                     entropy_p1 = -torch.sum(probs_p1 * (probs_p1 + 1e-8).log(), dim=-1)
                     entropy_p1 = entropy_p1 / np.log(probs_p1.shape[-1])
-                    pmass_p1 = torch.zeros_like(confidence_p1)
+
+                    # ✅ 修复：计算真实的pmass（只在第一次调用时）
+                    if phase1_steps_this_major_cycle == 0 and hasattr(model_outputs_p1, 'attentions') and model_outputs_p1.attentions is not None:
+                        last_layer_attn = model_outputs_p1.attentions[-1]  # [B, H, T, T]
+                        if last_layer_attn is not None and last_layer_attn.dim() == 4:
+                            # 🔬 添加attention特征计算切换 (P1阶段)
+                            import os
+                            attention_type = os.environ.get('ATTENTION_TYPE', 'pmass')
+                            print(f"🔍 DEBUG P1: 使用attention类型: {attention_type}")
+
+                            attn_avg = last_layer_attn[b_idx].mean(dim=0)  # [T, T]
+
+                            if attention_type == 'pmass':
+                                # 原始pmass计算
+                                gen_to_prompt_attn = attn_avg[prompt_length:, :prompt_length]
+                                pmass_full = gen_to_prompt_attn.sum(dim=-1)
+                            elif attention_type == 'attention_entropy':
+                                # Attention熵
+                                gen_attn = attn_avg[prompt_length:, :]
+                                gen_attn_normalized = gen_attn / (gen_attn.sum(dim=-1, keepdim=True) + 1e-8)
+                                pmass_full = -(gen_attn_normalized * (gen_attn_normalized + 1e-8).log()).sum(dim=-1)
+                                pmass_full = pmass_full / np.log(gen_attn.shape[-1])
+                            elif attention_type == 'max_attention':
+                                # 最大attention值
+                                gen_attn = attn_avg[prompt_length:, :]
+                                pmass_full = gen_attn.max(dim=-1)[0]
+                            elif attention_type == 'self_attention':
+                                # Self-attention强度
+                                gen_length = attn_avg.shape[0] - prompt_length
+                                if gen_length > 0:
+                                    gen_indices = torch.arange(prompt_length, attn_avg.shape[0], device=attn_avg.device)
+                                    pmass_full = attn_avg[gen_indices, gen_indices]
+                                else:
+                                    pmass_full = torch.tensor([], device=attn_avg.device)
+                            elif attention_type == 'attention_variance':
+                                # Attention方差
+                                gen_attn = attn_avg[prompt_length:, :]
+                                pmass_full = gen_attn.var(dim=-1)
+                            elif attention_type == 'k_direction':
+                                # K方向：被其他token关注的程度
+                                gen_length = attn_avg.shape[0] - prompt_length
+                                if gen_length > 0:
+                                    k_direction_scores = []
+                                    for i in range(prompt_length, attn_avg.shape[0]):
+                                        k_direction_score = attn_avg[:, i].sum()
+                                        k_direction_scores.append(k_direction_score)
+                                    pmass_full = torch.tensor(k_direction_scores, device=attn_avg.device)
+                                else:
+                                    pmass_full = torch.tensor([], device=attn_avg.device)
+                            else:
+                                # 默认使用pmass
+                                gen_to_prompt_attn = attn_avg[prompt_length:, :prompt_length]
+                                pmass_full = gen_to_prompt_attn.sum(dim=-1)
+                            # 只取当前周期的pmass
+                            if len(pmass_full) > start_cycle_idx:
+                                pmass_p1 = pmass_full[start_cycle_idx:start_cycle_idx + len(confidence_p1)]
+                                # 确保长度匹配
+                                if len(pmass_p1) != len(confidence_p1):
+                                    pmass_p1 = pmass_p1[:len(confidence_p1)] if len(pmass_p1) > len(confidence_p1) else torch.cat([pmass_p1, torch.zeros(len(confidence_p1) - len(pmass_p1), device=pmass_p1.device)])
+                            else:
+                                pmass_p1 = torch.zeros_like(confidence_p1)
+                        else:
+                            pmass_p1 = torch.zeros_like(confidence_p1)
+                    else:
+                        # 后续调用或没有attention时，pmass设为0
+                        pmass_p1 = torch.zeros_like(confidence_p1)
+
                     if hasattr(self, '_fuse_confidence'):
                         semantic_conf_p1 = self._fuse_confidence(confidence_p1, entropy_p1, pmass_p1)
                     else:

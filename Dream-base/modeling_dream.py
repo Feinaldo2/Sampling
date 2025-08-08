@@ -61,11 +61,56 @@ class SemanticWeightAttention(nn.Module):
         self.config = config
         self.use_static_fusion = False
         self.static_fusion_weights = [0.6, 0.2, 0.2]
-    
-    def forward(self, confidence, entropy, pmass):
+
+    def forward(self, confidence, entropy, pmass, use_attention_fusion=True):
+        """
+        融合置信度的方法
+
+        Args:
+            confidence: 原始置信度
+            entropy: 注意力熵
+            pmass: prompt关联度
+            use_attention_fusion: 是否启用attention融合
+
+        Returns:
+            融合后的置信度
+        """
+        # ✅ 修复：直接通过参数检查use_attention_fusion标志，避免循环引用
+        if not use_attention_fusion:
+            return confidence  # 如果关闭attention融合，直接返回原始置信度
+
         if self.use_static_fusion:
             w1, w2, w3 = self.static_fusion_weights
-            return w1 * confidence + w2 * entropy + w3 * pmass
+
+            # 🔬 支持线性和非线性融合策略
+            if hasattr(self, 'fusion_mode') and self.fusion_mode == 'nonlinear':
+                # 非线性融合：result = w1 * confidence * exp(w2 * entropy + w3 * pmass)
+                exp_term = torch.exp(w2 * entropy + w3 * pmass)
+                result = w1 * confidence * exp_term
+            else:
+                # 线性融合：result = w1 * confidence + w2 * entropy + w3 * pmass
+                result = w1 * confidence + w2 * entropy + w3 * pmass
+
+            # 调试信息（仅在rank 0时输出）
+            import os
+            if int(os.environ.get("RANK", "0")) == 0:
+                if not hasattr(self, '_debug_counter'):
+                    self._debug_counter = 0
+                self._debug_counter += 1
+                if self._debug_counter <= 3:  # 只输出前3次
+                    weight_sum = w1 + w2 + w3
+                    fusion_type = getattr(self, 'fusion_mode', 'linear')
+                    print(f"🔬 AdLLM融合调试 #{self._debug_counter} ({fusion_type}):")
+                    print(f"   权重: w1={w1:.3f}, w2={w2:.3f}, w3={w3:.3f} (总和={weight_sum:.3f})")
+                    print(f"   均值: conf={confidence.mean():.4f}, entropy={entropy.mean():.4f}, pmass={pmass.mean():.4f}")
+                    if fusion_type == 'nonlinear':
+                        exp_term_mean = torch.exp(w2 * entropy + w3 * pmass).mean()
+                        print(f"   exp项: exp({w2:.3f}*entropy + {w3:.3f}*pmass) = {exp_term_mean:.4f}")
+                    print(f"   融合前后: {confidence.mean():.4f} -> {result.mean():.4f}")
+                    if result.mean() < 0:
+                        print(f"   ⚠️  融合结果为负值，这在数学上是允许的")
+
+            return result
         else:
             return confidence
 
@@ -331,8 +376,13 @@ class DreamAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            # 🔧 修复：处理attention_mask为字符串"full"的情况
+            if isinstance(attention_mask, str) and attention_mask == "full":
+                causal_mask = None  # 使用默认的causal mask
+            else:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            if causal_mask is not None:
+                attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -758,6 +808,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
 
         # ✅ 添加语义权重注意力模块
         self.semantic_weight_attention = SemanticWeightAttention(config)
+        # ✅ 移除循环引用，避免RecursionError
 
         # ✅ 初始化融合相关属性
         self.use_attention_fusion = False
@@ -767,8 +818,34 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         self.post_init()
 
     def _fuse_confidence(self, confidence, entropy, pmass):
-        """融合置信度的方法"""
-        return self.semantic_weight_attention(confidence, entropy, pmass)
+        """
+        融合置信度的方法
+
+        Args:
+            confidence: 原始置信度
+            entropy: 注意力熵
+            pmass: prompt关联度
+
+        Returns:
+            融合后的置信度
+        """
+        # 🔍 添加pmass调试信息
+        import os
+        if os.environ.get('PMASS_DEBUG', '0') == '1':
+            if hasattr(self, '_pmass_debug_counter'):
+                self._pmass_debug_counter += 1
+            else:
+                self._pmass_debug_counter = 1
+
+            if self._pmass_debug_counter <= 5:  # 只输出前5次
+                print(f"🔍 Pmass调试 #{self._pmass_debug_counter}:")
+                print(f"   pmass统计: min={pmass.min():.4f}, max={pmass.max():.4f}, mean={pmass.mean():.4f}")
+                print(f"   pmass非零比例: {(pmass > 0).float().mean():.2f}")
+                print(f"   confidence统计: min={confidence.min():.4f}, max={confidence.max():.4f}, mean={confidence.mean():.4f}")
+                print(f"   entropy统计: min={entropy.min():.4f}, max={entropy.max():.4f}, mean={entropy.mean():.4f}")
+                print(f"   融合权重: {getattr(self.semantic_weight_attention, 'static_fusion_weights', 'unknown')}")
+
+        return self.semantic_weight_attention(confidence, entropy, pmass, self.use_attention_fusion)
 
     def reset_rope_parameters(self):
         self.model.rotary_emb.reset_parameters()
