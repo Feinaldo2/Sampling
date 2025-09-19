@@ -20,13 +20,22 @@ STATIC_WEIGHT="0.7|0.2|0.1"         # 仅 static 时有效
 DYNAMIC_WEIGHT_PATH=""              # 仅 dynamic 时填写权重路径
 FEATURE_PATH=""                     # 如有自定义特征文件则填写
 
+# 注意力特征类型配置
+ATTENTION_TYPE="attention_entropy"              # 可选值: 
+                                    # - pmass: prompt关联度（默认，生成token对prompt的注意力总和）
+                                    # - attention_entropy: 注意力熵（注意力分布的不确定性）
+                                    # - max_attention: 最大注意力值（对任意token的最大注意力）
+                                    # - self_attention: 自注意力强度（token对自身的注意力）
+                                    # - attention_variance: 注意力方差（注意力分布的方差）
+                                    # - k_direction: K方向注意力（被其他token关注的程度）
+
 # ✅ 与原始Slow-Fast保持完全一致的算法参数
 K_EXPLORATION_STEPS=6               # 探索步数：与原始版本完全一致
 CYCLE_STABILITY_WINDOW=2            # 稳定性窗口：与原始版本完全一致
 USE_FAST_ATTENTION="True"           # 仅启用向量化优化（不改变算法逻辑）
 
 # 运行 Dream 本地模型评测（添加原始Slow-Fast的关键参数）
-accelerate launch --config_file ${ACCEL_CONFIG} evaluation_script.py --model dream \
+ATTENTION_TYPE=${ATTENTION_TYPE} accelerate launch --config_file ${ACCEL_CONFIG} evaluation_script.py --model dream \
   --model_args "pretrained=${MODEL},max_new_tokens=${MAX_NEW_TOKENS},diffusion_steps=${DIFFUSION_STEPS},temperature=${TEMPERATURE},top_p=${TOP_P},alg=entropy,alg_temp=0.0,add_bos_token=${ADD_BOS_TOKEN},is_feature_cache=False,is_cfg_cache=False,use_attention_fusion=${USE_ATTENTION_FUSION},fusion_type=${FUSION_TYPE},static_weight=${STATIC_WEIGHT},dynamic_weight_path=${DYNAMIC_WEIGHT_PATH},feature_path=${FEATURE_PATH},k_exploration_steps=${K_EXPLORATION_STEPS},cycle_length_stability_window=${CYCLE_STABILITY_WINDOW},use_fast_attention=${USE_FAST_ATTENTION}" \
   --tasks ${TASK} \
   --num_fewshot ${NUM_FEWSHOT} \

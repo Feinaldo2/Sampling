@@ -232,14 +232,24 @@ class SlowFastSampler:
                 logits_main_out = self.model(x, attention_mask=attention_mask, output_attentions=True)
                 logits_main = logits_main_out.logits
                 attn_main = logits_main_out.attentions[-1] if hasattr(logits_main_out, 'attentions') else None
+                
+                # 🚀 显存优化：及时释放第一次模型调用的输出
+                del logits_main_out
+                
                 cfg_logits_main_out = self.model(cfg_x, attention_mask=attention_mask, output_attentions=True)
                 cfg_logits_main = cfg_logits_main_out.logits
                 logits_full = logits_main + self.cfg_scale * (logits_main - cfg_logits_main)
                 attn = attn_main
+                
+                # 🚀 显存优化：及时释放CFG相关变量
+                del cfg_x, logits_main, cfg_logits_main_out, cfg_logits_main
             else:
                 logits_out = self.model(x, attention_mask=attention_mask, output_attentions=True)
                 logits_full = logits_out.logits
                 attn = logits_out.attentions[-1] if hasattr(logits_out, 'attentions') else None
+                
+                # 🚀 显存优化：及时释放模型输出
+                del logits_out
             logits_gen_part = logits_full[:, prompt_length:]
             x0_gen = torch.argmax(self.add_gumbel_noise(logits_gen_part), dim=-1)
             p_gen = F.softmax(logits_gen_part, dim=-1)
@@ -273,6 +283,13 @@ class SlowFastSampler:
                     # 没有mask tokens，使用原始置信度
                     current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
                     confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
+                
+                # 🚀 显存优化：注意力权重使用完后立即释放
+                del attn
+                if 'features' in locals():
+                    del features
+                if 'weights' in locals():
+                    del weights
             else:
                 current_global_mask_index_gen_part = (x[:, prompt_length:] == self.mask_id)
                 confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
@@ -341,6 +358,11 @@ class SlowFastSampler:
                                     abs_indices_to_fill_in_gen = fill_op_abs_start_in_gen + top_k_indices_relative_to_fill_scope
                                     transfer_mask_p1[b_idx, abs_indices_to_fill_in_gen] = True
             x[:, prompt_length:][transfer_mask_p1] = x0_gen[transfer_mask_p1]
+            
+            # 🚀 显存优化：清理中间变量
+            del logits_gen_part, x0_gen, p_gen, x0_p_gen
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # After k_exploration_steps, if any item's sub-cycle length is not determined, use a fallback.
         for b_idx in range(batch_size):
@@ -389,10 +411,17 @@ class SlowFastSampler:
                     logits_main_out = self.model(x, attention_mask=attention_mask, output_attentions=True)
                     logits_main = logits_main_out.logits
                     attn_main = logits_main_out.attentions[-1] if hasattr(logits_main_out, 'attentions') else None
+                    
+                    # 🚀 显存优化：及时释放
+                    del logits_main_out
+                    
                     cfg_logits_main_out = self.model(cfg_x, attention_mask=attention_mask, output_attentions=True)
                     cfg_logits_main = cfg_logits_main_out.logits
                     logits_full = logits_main + self.cfg_scale * (logits_main - cfg_logits_main)
                     attn = attn_main
+                    
+                    # 🚀 显存优化：及时释放CFG变量
+                    del cfg_x, cfg_logits_main_out, logits_main, cfg_logits_main
                 else:
                     cfg_x = x.clone()
                     cfg_x[prompt_index_full_x] = self.mask_id
@@ -403,11 +432,18 @@ class SlowFastSampler:
                         logits_main_part_out = self.model(x[:, :prompt_length + active_region_end_check_list[b_idx_check]], attention_mask=attention_mask, output_attentions=True)
                         logits_main_part = logits_main_part_out.logits
                         attn_main_part = logits_main_part_out.attentions[-1] if hasattr(logits_main_part_out, 'attentions') else None
+                        
+                        # 🚀 显存优化：及时释放
+                        del logits_main_part_out
+                        
                         cfg_logits_main_part_out = self.model(cfg_x[:, :prompt_length + active_region_end_check_list[b_idx_check]], attention_mask=attention_mask, output_attentions=True)
                         cfg_logits_main_part = cfg_logits_main_part_out.logits
                         logits_main_batch.append(torch.cat([logits_main_part[b_idx_check].unsqueeze(0), cache_out_cycle_logits_list[b_idx_check]], dim=1))
                         cfg_logits_main_batch.append(torch.cat([cfg_logits_main_part[b_idx_check].unsqueeze(0), cache_out_cycle_cfg_logits_list[b_idx_check]],dim=1))
                         attn = attn_main_part  # 只取最后一个 batch 的 attn
+                        
+                        # 🚀 显存优化：及时释放循环中的变量
+                        del cfg_logits_main_part_out, logits_main_part, cfg_logits_main_part
                     logits_main = torch.cat(logits_main_batch, dim=0)
                     cfg_logits_main = torch.cat(cfg_logits_main_batch, dim=0)
                     logits_full = logits_main + self.cfg_scale * (logits_main - cfg_logits_main)
@@ -459,6 +495,13 @@ class SlowFastSampler:
                 else:
                     # 没有mask tokens，使用原始置信度
                     confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
+                
+                # 🚀 显存优化：注意力权重使用完后立即释放
+                del attn
+                if 'features' in locals():
+                    del features
+                if 'weights' in locals():
+                    del weights
             else:
                 confidence_gen_wide = torch.where(current_global_mask_index_gen_part, x0_p_gen, torch.tensor(-np.inf, device=x.device, dtype=x0_p_gen.dtype))
             transfer_mask_p2_and_p3 = torch.zeros_like(x0_gen, dtype=torch.bool)
@@ -487,6 +530,11 @@ class SlowFastSampler:
                     transfer_mask_p2_and_p3[b_idx, abs_indices_to_fill] = True
                     
             x[:, prompt_length:][transfer_mask_p2_and_p3] = x0_gen[transfer_mask_p2_and_p3] # Update x
+            
+            # 🚀 显存优化：清理fast_phase中的中间变量
+            del logits_gen_part, x0_gen, p_gen, x0_p_gen, confidence_gen_wide
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return x
     def generate(self, input_ids, attention_mask):
         with torch.no_grad():
